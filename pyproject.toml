@@ -1,0 +1,29 @@
+[project]
+name = "hm-clothes-rec"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Austin Wong", email = "256239685+aw1192@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=2.0.0",
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "pandas>=3.1.0",
+    "pillow>=13.0.0",
+    "scikit-learn>=1.9.1",
+    "sentence-transformers>=6.2.0",
+    "timm>=1.0.30",
+    "torch>=2.14.1",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+hm-clothes-rec = "hm_clothes_rec:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
