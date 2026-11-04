@@ -37,6 +37,8 @@ class TwoTowerRetrieval(nn.Module):
     def forward(self, user_feat, item_feat):
         item_emb = self.item_forward(item_feat)
         user_emb = self.user_forward(user_feat)
+
+        # cosine similarity of embeddings
         sim = item_emb @ user_emb.T
         return sim
 
