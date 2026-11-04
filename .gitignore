@@ -13,6 +13,8 @@ wheels/
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+TODO.md
+notebooks/
 
 # Data
 data/
