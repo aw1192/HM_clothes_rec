@@ -17,7 +17,17 @@ class TwoTowerRetrieval(nn.Module):
         # ========== ITEM TOWER ===========
 
         # RETURN EMBEDDING WITH 256 DIMENSIONS
-        self.item_tower = None # build architecture here
+        placeholder = 100 # TODO: decide on the input size
+
+        self.item_tower = nn.Sequential(
+            nn.Linear(placeholder, 1024),
+            nn.ReLU(),
+            nn.Dropout(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(),
+            nn.Linear(512, 256)
+        )
 
 
         # ========== USER TOWER ===========
@@ -29,12 +39,25 @@ class TwoTowerRetrieval(nn.Module):
 
     # ========= FORWARD PASS =========
     def item_forward(self, x):
+        '''
+        x: input
+        '''
+
         return F.normalize(self.item_tower(x)) # item emb, normalized
 
     def user_forward(self, x):
+        '''
+        x: input
+        '''
+        
         return F.normalize(self.user_tower(x)) # user emb, normalized
 
-    def forward(self, user_feat, item_feat):
+    def all_forward(self, user_feat, item_feat):
+        '''
+        user_feat: input for the user tower
+        item_feat: input for the item tower
+        '''
+
         item_emb = self.item_forward(item_feat)
         user_emb = self.user_forward(user_feat)
 
@@ -58,7 +81,13 @@ class TwoTowerRetrieval(nn.Module):
     def logq(self, ):
         pass
 
-    def logq_loss(self, sim, temp, log_q):
-        logits = sim/temp 
+    def logq_loss(self, sim, T, log_q):
+        '''
+        sim: similarity measure
+        T: temperature
+        log_q: log q correction
+        '''
+
+        logits = sim/T
         logits = logits - log_q
         return None 
