@@ -20,7 +20,7 @@ class TwoTowerRetrieval(nn.Module):
         placeholder = 100 # TODO: decide on the input size
 
         self.item_tower = nn.Sequential(
-            nn.Linear(placeholder, 1024),
+            nn.LazyLinear(1024), # LazyLinear for now, during prototyping phase
             nn.ReLU(),
             nn.Dropout(),
             nn.Linear(1024, 512),
@@ -49,7 +49,7 @@ class TwoTowerRetrieval(nn.Module):
         '''
         x: input
         '''
-        
+
         return F.normalize(self.user_tower(x)) # user emb, normalized
 
     def all_forward(self, user_feat, item_feat):
@@ -90,4 +90,7 @@ class TwoTowerRetrieval(nn.Module):
 
         logits = sim/T
         logits = logits - log_q
+
+        # remove duplicate items that contribute to the negative
+
         return None 
