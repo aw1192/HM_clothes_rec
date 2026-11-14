@@ -42,7 +42,12 @@ class TwoTowerRetrieval(nn.Module):
         # ========== USER TOWER ===========
 
         # RETURN EMBEDDING WITH 256 DIMENSIONS
-        self.user_tower = None # build architecture here
+        self.user_tower = nn.Sequential(
+            nn.LazyLinear(512), # LazyLinear like the item tower, input is the output of user_features (43 wide for now)
+            nn.ReLU(),
+            nn.Dropout(),
+            nn.Linear(512, 256)
+        )
         
 
         # ========== LOG Q  ===========
