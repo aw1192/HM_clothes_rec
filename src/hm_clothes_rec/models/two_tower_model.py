@@ -94,16 +94,6 @@ class TwoTowerRetrieval(nn.Module):
         # (N_users, n_cat_cols), cols in the same order as self.user_embs
         self.register_buffer('user_cat', torch.tensor(customers.to_numpy(), dtype=torch.long))
 
-
-        # ======= TEXT EMBEDDINGS =======
-
-
-
-
-        # ======= IMAGE EMBEDDINGS ======
-
-
-
     # ========= FORWARD PASS =========
     def item_forward(self, x):
         '''
