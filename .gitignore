@@ -22,3 +22,4 @@ data/
 *.csv
 *.npy
 *.pt
+tmp.py

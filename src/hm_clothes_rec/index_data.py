@@ -68,6 +68,10 @@ articles['median_price'] = articles['median_price'].fillna(type_median).fillna(a
 # item_id = row position, the integer every model / embedding table is indexed by
 articles.insert(0, 'item_id', np.arange(len(articles), dtype='int64'))
 
+# has_image = 1 if the article's image exists at images/{first 3 chars}/{article_id}.webp, else 0
+img_dir = DATA_DIR / 'cleaned' / 'images'
+articles['has_image'] = [int((img_dir / aid[:3] / f'{aid}.webp').exists()) for aid in articles['article_id']]
+
 # save indexed data + lookup tables (lookup sizes = embedding num_embeddings)
 articles.to_parquet(idx_dir / 'articles_indexed.parquet', index=False)
 articles[['item_id', 'article_id']].to_parquet(idx_dir / 'item_ids.parquet', index=False) # item_id <-> article_id
