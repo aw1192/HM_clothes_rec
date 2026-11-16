@@ -65,8 +65,12 @@ articles = articles.drop(columns='cnt')
 type_median = articles.groupby('product_type_name')['median_price'].transform('median')
 articles['median_price'] = articles['median_price'].fillna(type_median).fillna(articles['median_price'].median())
 
+# item_id = row position, the integer every model / embedding table is indexed by
+articles.insert(0, 'item_id', np.arange(len(articles), dtype='int64'))
+
 # save indexed data + lookup tables (lookup sizes = embedding num_embeddings)
 articles.to_parquet(idx_dir / 'articles_indexed.parquet', index=False)
+articles[['item_id', 'article_id']].to_parquet(idx_dir / 'item_ids.parquet', index=False) # item_id <-> article_id
 with open(idx_dir / 'item_emb_lookup.json', 'w') as f:
     json.dump(item_emb_lookup, f)
 
@@ -92,9 +96,36 @@ for col in user_cols:
     user_emb_lookup[col] = {value: i for i, value in enumerate(uniques)}
     customers[col] = customers[col].map(user_emb_lookup[col]).astype('int64')
 
+# user_id = row position, the integer the user tower is indexed by
+customers.insert(0, 'user_id', np.arange(len(customers), dtype='int64'))
+
 # save indexed data + lookup tables
 customers.to_parquet(idx_dir / 'customers_indexed.parquet', index=False)
+customers[['user_id', 'customer_id']].to_parquet(idx_dir / 'user_ids.parquet', index=False) # user_id <-> customer_id
 with open(idx_dir / 'user_emb_lookup.json', 'w') as f:
     json.dump(user_emb_lookup, f)
+
+
+# INDEXING TRANSACTIONS DATA
+# swap the string ids for the integer ids above (done in duckdb, transactions is too big for pandas)
+item_map = articles[['item_id', 'article_id']]
+user_map = customers[['user_id', 'customer_id']]
+tx_path = DATA_DIR / 'cleaned' / 'transactions_clean.parquet'
+tx_idx_path = idx_dir / 'transactions_indexed.parquet'
+
+duckdb.sql(f'''
+    COPY (
+        SELECT u.user_id, i.item_id, t.t_dat, t.price, t.sales_channel_id
+        FROM '{tx_path}' t
+        JOIN user_map u USING (customer_id)
+        JOIN item_map i USING (article_id)
+        ORDER BY t.t_dat
+    ) TO '{tx_idx_path}' (FORMAT parquet)
+''')
+
+# inner joins drop rows with ids missing from the lookup tables, there should be none
+n_raw = duckdb.sql(f"SELECT COUNT(*) FROM '{tx_path}'").fetchall()[0][0]
+n_idx = duckdb.sql(f"SELECT COUNT(*) FROM '{tx_idx_path}'").fetchall()[0][0]
+assert n_raw == n_idx, f'{n_raw - n_idx} transactions have an article_id / customer_id not in the lookup tables'
 
 
