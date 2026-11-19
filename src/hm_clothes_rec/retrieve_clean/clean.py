@@ -1,7 +1,7 @@
 import duckdb
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parents[2]  / 'data' / 'downsized'
+DATA_DIR = Path(__file__).resolve().parents[3]  / 'data' / 'downsized'
 
 ITEMS = DATA_DIR / 'articles.parquet'
 USERS = DATA_DIR / 'customers.parquet'

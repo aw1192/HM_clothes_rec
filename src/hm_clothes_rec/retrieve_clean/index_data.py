@@ -3,17 +3,14 @@ Final cleaning stage. Indexes all categorical features by integers.
 Create embedding lookup tables.
 '''
 
-# TODO: RERUN THIS FILE AFTER DATA SPLITS ARE CREATED
-
 import json
+from pathlib import Path
 
 import duckdb
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
-
-DATA_DIR = Path(__file__).resolve().parents[2] / 'data'
+DATA_DIR = Path(__file__).resolve().parents[3] / 'data'
 
 idx_dir = DATA_DIR / 'indexed'
 
@@ -32,12 +29,14 @@ UNKNOWN = 'Unknown'
 item_emb_lookup = {} # {col: {value: idx}}, index 0 reserved for UNKNOWN in every col
 
 # keep product codes / names shared by >= 3 articles, merge the rest into UNKNOWN (idx 0)
+# MANUALLY CHECKED 
 for col in ['product_code', 'prod_name']:
     col_counts = articles[col].value_counts()
     keep = col_counts[col_counts >= 3].index
     articles.loc[~articles[col].isin(keep), col] = UNKNOWN
 
 # run thru every relevant column, find their uniques, and map the data to an integer index based on the unique values.
+# MANUALLY CHECKED
 for col in item_cols:
     # merge 'Unknown' / 'Undefined' / 'undefined' etc. into a single UNKNOWN label
     is_unknown = articles[col].str.lower().isin(['unknown', 'undefined'])
@@ -49,6 +48,7 @@ for col in item_cols:
 
 # item probability = (# transactions with item) / (total # transactions)
 # median price = median of the item's transaction prices
+# MANUALLY CHECKED
 item_counts = duckdb.sql(f'''
     SELECT article_id, COUNT(*) AS cnt, MEDIAN(price) AS median_price
     FROM '{DATA_DIR / 'cleaned' / 'transactions_clean.parquet'}'
@@ -56,23 +56,28 @@ item_counts = duckdb.sql(f'''
 ''').df()
 
 # add item probability and median price into the articles table
+# MANUALLY CHECKED
 articles = articles.merge(item_counts, on='article_id', how='left')
 item_prob = (articles['cnt'].fillna(0) + 1) / (item_counts['cnt'].sum() + len(articles)) # add-one smoothing
 articles['item_log_prob'] = np.log(item_prob) # log q for sampling bias correction
 articles = articles.drop(columns='cnt')
 
-# items with no transactions get the median price of their product type
+# items with no transactions get the median price of their product type, or if still NA, then fill with median over all items
+# MANUALLY CHECKED
 type_median = articles.groupby('product_type_name')['median_price'].transform('median')
 articles['median_price'] = articles['median_price'].fillna(type_median).fillna(articles['median_price'].median())
 
 # item_id = row position, the integer every model / embedding table is indexed by
+# MANUALLY CHECKED
 articles.insert(0, 'item_id', np.arange(len(articles), dtype='int64'))
 
 # has_image = 1 if the article's image exists at images/{first 3 chars}/{article_id}.webp, else 0
+# MANUALLY CHECKED 
 img_dir = DATA_DIR / 'cleaned' / 'images'
 articles['has_image'] = [int((img_dir / aid[:3] / f'{aid}.webp').exists()) for aid in articles['article_id']]
 
 # save indexed data + lookup tables (lookup sizes = embedding num_embeddings)
+# MANUALLY CHECKED 
 articles.to_parquet(idx_dir / 'articles_indexed.parquet', index=False)
 articles[['item_id', 'article_id']].to_parquet(idx_dir / 'item_ids.parquet', index=False) # item_id <-> article_id
 with open(idx_dir / 'item_emb_lookup.json', 'w') as f:
@@ -85,12 +90,14 @@ user_cols = customers.columns.drop(['customer_id'])
 customers['fashion_news_frequency'] = customers['fashion_news_frequency'].replace('None', 'NONE')
 
 # keep postal codes with >= 11 customers (~11k indices), merge the rest into UNKNOWN (idx 0), also serves as the bucket for unseen codes
+# MANUALLY CHECKED 
 postal_counts = customers['postal_code'].value_counts()
 top_postal = postal_counts[postal_counts >= 11].index
 customers.loc[~customers['postal_code'].isin(top_postal), 'postal_code'] = UNKNOWN
 
 user_emb_lookup = {} # {col: {value: idx}}, index 0 reserved for UNKNOWN in every col
 
+# MANUALLY CHECKED
 for col in user_cols:
     # merge 'unknown' / 'Undefined' etc. into a single UNKNOWN label
     is_unknown = customers[col].str.lower().isin(['unknown', 'undefined'])
@@ -100,16 +107,18 @@ for col in user_cols:
     user_emb_lookup[col] = {value: i for i, value in enumerate(uniques)}
     customers[col] = customers[col].map(user_emb_lookup[col]).astype('int64')
 
+# MANUALLY CHECKED
 # user_id = row position, the integer the user tower is indexed by
 customers.insert(0, 'user_id', np.arange(len(customers), dtype='int64'))
 
+# MANUALLY CHECKED
 # save indexed data + lookup tables
 customers.to_parquet(idx_dir / 'customers_indexed.parquet', index=False)
 customers[['user_id', 'customer_id']].to_parquet(idx_dir / 'user_ids.parquet', index=False) # user_id <-> customer_id
 with open(idx_dir / 'user_emb_lookup.json', 'w') as f:
     json.dump(user_emb_lookup, f)
 
-
+# MANUALLY CHECKED
 # INDEXING TRANSACTIONS DATA
 # swap the string ids for the integer ids above (done in duckdb, transactions is too big for pandas)
 item_map = articles[['item_id', 'article_id']]
@@ -127,6 +136,7 @@ duckdb.sql(f'''
     ) TO '{tx_idx_path}' (FORMAT parquet)
 ''')
 
+# MANUALLY CHECKED
 # inner joins drop rows with ids missing from the lookup tables, there should be none
 n_raw = duckdb.sql(f"SELECT COUNT(*) FROM '{tx_path}'").fetchall()[0][0]
 n_idx = duckdb.sql(f"SELECT COUNT(*) FROM '{tx_idx_path}'").fetchall()[0][0]

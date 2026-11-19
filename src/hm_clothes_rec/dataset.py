@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+# MANUALLY CHECKED
 class TransactionDataset(Dataset):
     # expects integer columns 'user_id' and 'item_id' after Austin's indexing step
 

@@ -1,4 +1,4 @@
-from hm_clothes_rec.splits import load_split
+from hm_clothes_rec.retrieve_clean.splits import load_split
 
 
 def load_truth(split):

@@ -8,7 +8,7 @@ from tqdm import tqdm
 ID_COLS = {'article_id': 'VARCHAR', 'product_code': 'VARCHAR'}
 
 # <repo root>/data
-DATA_DIR = Path(__file__).resolve().parents[2] / 'data' # get the data directory 
+DATA_DIR = Path(__file__).resolve().parents[3] / 'data' # get the data directory 
 RAW_DIR = DATA_DIR / 'raw'
 OUT_DIR = DATA_DIR / 'downsized'
 

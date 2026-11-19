@@ -1,13 +1,14 @@
+import shutil
 from datetime import timedelta
 from pathlib import Path
 
 import duckdb
 
-DATA_DIR = Path(__file__).resolve().parents[2] / 'data' / 'cleaned'
+DATA_DIR = Path(__file__).resolve().parents[3] / 'data' / 'indexed'
 
 ITEMS = DATA_DIR / 'articles_clean.parquet'
 USERS = DATA_DIR / 'customers_clean.parquet'
-INTERACTIONS = DATA_DIR / 'transactions_clean.parquet'
+INTERACTIONS = DATA_DIR / 'transactions_indexed.parquet'
 
 OUT_DIR = DATA_DIR.parent / 'splits'
 
@@ -81,3 +82,6 @@ if __name__ == "__main__":
     all_rows = duckdb.read_parquet(str(INTERACTIONS)).count('*').fetchall()[0][0]
     assert total == all_rows, f'splits cover {total:,} of {all_rows:,} rows'
     print(f'{"total":16} {"":24} {total:>12,}')
+
+    shutil.copytree(DATA_DIR, OUT_DIR / DATA_DIR.name, dirs_exist_ok=True)
+
