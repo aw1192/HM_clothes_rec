@@ -109,7 +109,7 @@ class TwoTowerRetrieval(nn.Module):
 
         return F.normalize(self.user_tower(x)) # user emb, normalized
 
-    def all_forward(self, user_feat, item_feat):
+    def forward(self, user_feat, item_feat):
         '''
         user_feat: input for the user tower
         item_feat: input for the item tower
@@ -173,11 +173,152 @@ class TwoTowerRetrieval(nn.Module):
 
         return F.cross_entropy(logits, labels)
 
-    def fit(self, data):
-        '''
-        data: a Dataset object
-        '''
-        pass
 
+    # ========= TRAINING =========
+    def batch_loss(self, item_ids, user_ids, T):
+        '''
+        item_ids, user_ids: LongTensors (B,), already on the model's device
+        returns: scalar logq corrected in-batch softmax loss
+        '''
+        sim = self(self.user_features(user_ids), self.item_features(item_ids)) # (B,B)
+        return self.logq_loss(sim, T, item_ids)
+
+    @staticmethod
+    def iter_batches(user_ids, item_ids, batch_size, shuffle):
+        '''
+        user_ids, item_ids: LongTensors (N,), already on the model's device
+        yields (item_ids, user_ids) batches of exactly batch_size by slicing, no per row python work
+        the last partial batch is dropped so every batch has the same number of in-batch negatives
+        '''
+        n = len(item_ids)
+        order = torch.randperm(n, device=item_ids.device) if shuffle else torch.arange(n, device=item_ids.device)
+        for start in range(0, n - batch_size + 1, batch_size):
+            idx = order[start:start + batch_size]
+            yield item_ids[idx], user_ids[idx]
+
+    def train_epoch(self, user_ids, item_ids, optimizer, T, batch_size):
+        '''
+        one shuffled pass over the training pairs, returns the mean batch loss
+        '''
+        self.train() # turn dropout on
+
+        # accumulate on device, calling .item() every step would force a gpu sync per batch
+        total = torch.zeros((), device=item_ids.device)
+        n_batches = 0
+        for b_items, b_users in self.iter_batches(user_ids, item_ids, batch_size, shuffle=True):
+            optimizer.zero_grad()
+            loss = self.batch_loss(b_items, b_users, T)
+            loss.backward()
+            optimizer.step()
+
+            total += loss.detach()
+            n_batches += 1
+
+        return total.item() / max(n_batches, 1)
+
+    @torch.no_grad()
+    def all_item_embs(self, chunk_size=8192):
+        '''
+        embeds the whole catalog, returns FloatTensor (N_items, 256), row position = item id
+        '''
+        n_items = self.item_cat.size(0)
+        embs = []
+        for start in range(0, n_items, chunk_size):
+            ids = torch.arange(start, min(start + chunk_size, n_items), device=self.item_cat.device)
+            embs.append(self.item_forward(self.item_features(ids)))
+        return torch.cat(embs)
+
+    @torch.no_grad()
+    def recall_at_k(self, user_ids, item_ids, ks, chunk_size=1024):
+        '''
+        user_ids, item_ids: LongTensors (N,), the ground truth (user, item) purchase pairs
+        ks: cutoffs, e.g. (12, 50, 100)
+        returns: dict {'recall@k': float}, same definition as evaluate.recall_at_k:
+                 per user |top k ∩ bought| / |bought|, averaged over every user in the pairs
+        '''
+        self.eval()
+        n_items = self.item_cat.size(0)
+        item_emb = self.all_item_embs() # (N_items, 256)
+
+        # encode each distinct (user, item) pair as one int so membership is a single isin
+        device = self.item_cat.device
+        keys = torch.unique(user_ids.to(device) * n_items + item_ids.to(device)) # sorted, duplicates removed
+
+        # distinct users and how many distinct items each bought (keys are sorted by user)
+        eval_users, n_bought = torch.unique(keys // n_items, return_counts=True)
+
+        max_k = max(ks)
+        totals = dict.fromkeys(ks, 0.0)
+        for start in range(0, len(eval_users), chunk_size):
+            u = eval_users[start:start + chunk_size] # (C,)
+            denom = n_bought[start:start + chunk_size].float() # (C,)
+
+            # no log q here, the correction is only for the sampled training loss
+            scores = self.user_forward(self.user_features(u)) @ item_emb.T # (C, N_items)
+            topk = scores.topk(max_k, dim=1).indices # (C, max_k), best first
+
+            hits = torch.isin(u.unsqueeze(1) * n_items + topk, keys) # (C, max_k), True if bought
+            cum_hits = hits.cumsum(dim=1) # hits within the first j+1 positions
+
+            for k in ks:
+                totals[k] += (cum_hits[:, k - 1] / denom).sum().item()
+
+        return {f'recall@{k}': totals[k] / len(eval_users) for k in ks}
+
+    @torch.no_grad()
+    def eval_epoch(self, user_ids, item_ids, T, batch_size, ks=(12, 50, 100)):
+        '''
+        one pass over the validation pairs, no gradient updates
+        returns: (mean batch loss, dict of recall@k over the full catalog)
+        '''
+        self.eval() # turn dropout off
+
+        total = torch.zeros((), device=item_ids.device)
+        n_batches = 0
+        for b_items, b_users in self.iter_batches(user_ids, item_ids, batch_size, shuffle=False):
+            total += self.batch_loss(b_items, b_users, T)
+            n_batches += 1
+
+        recall = self.recall_at_k(user_ids, item_ids, ks) # uses every val row, not just the full batches
+
+        return total.item() / max(n_batches, 1), recall
+
+    def fit(self, train_data, val_data, epochs, batch_size=2048, lr=1e-3, weight_decay=0.0, T=0.05, ks=(12, 50, 100), device=None):
+        '''
+        train_data, val_data: TransactionDataset objects
+        epochs: number of passes over the training data
+        batch_size: also the number of candidates per user in the loss (B-1 in-batch negatives)
+        T: softmax temperature for the logq loss
+        ks: cutoffs for val recall@k
+        returns: dict with per epoch train loss, val loss and val recall@k
+        '''
+        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.to(device)
+
+        # move the id columns to the device once, batches are then just index slices
+        train_users, train_items = train_data.user_ids.to(device), train_data.item_ids.to(device)
+        val_users, val_items = val_data.user_ids.to(device), val_data.item_ids.to(device)
+
+        # dry run so the LazyLinear layers get their shapes before the optimizer sees the parameters
+        with torch.no_grad():
+            dummy = torch.zeros(2, dtype=torch.long, device=device)
+            self(self.user_features(dummy), self.item_features(dummy))
+
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
+
+        history = {'train_loss': [], 'val_loss': [], **{f'recall@{k}': [] for k in ks}}
+        for e in range(epochs):
+            train_loss = self.train_epoch(train_users, train_items, optimizer, T, batch_size)
+            val_loss, recall = self.eval_epoch(val_users, val_items, T, batch_size, ks)
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            for name, value in recall.items():
+                history[name].append(value)
+
+            recall_str = ' | '.join(f'{name} {value:.4f}' for name, value in recall.items())
+            print(f'epoch {e + 1}/{epochs} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | {recall_str}')
+
+        return history
 
 
