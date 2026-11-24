@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import torch
 from torch import nn
@@ -21,7 +22,12 @@ class TwoTowerRetrieval(nn.Module):
     Two tower model for retrieval in recommendation systems.
     '''
 
-    def __init__(self):
+    def __init__(self, max_hist=30):
+        '''
+        max_hist: number of most recent purchases used as a user's history.
+                  history is cut per (user, day) pair: only purchases strictly before that day count,
+                  so every transaction is both a training pair and history for the user's later pairs
+        '''
         super().__init__() # necessary to use nn.Module
 
         # ========== ITEM TOWER ===========
@@ -43,7 +49,7 @@ class TwoTowerRetrieval(nn.Module):
 
         # RETURN EMBEDDING WITH 256 DIMENSIONS
         self.user_tower = nn.Sequential(
-            nn.LazyLinear(512), # LazyLinear like the item tower, input is the output of user_features (43 wide for now)
+            nn.LazyLinear(512), # LazyLinear like the item tower, input is the output of user_features (43 + 40 history = 83 wide)
             nn.ReLU(),
             nn.Dropout(),
             nn.Linear(512, 256)
@@ -94,6 +100,35 @@ class TwoTowerRetrieval(nn.Module):
         # (N_users, n_cat_cols), cols in the same order as self.user_embs
         self.register_buffer('user_cat', torch.tensor(customers.to_numpy(), dtype=torch.long))
 
+        # ===== USER PURCHASE HISTORY =====
+
+        # every transaction sorted by (user, day). a user's purchases are then one contiguous block, oldest first,
+        # and "the L purchases before day d" is just the L slots ending where day d starts in that block
+        self.max_hist = max_hist
+        tx = duckdb.sql(f'''
+            SELECT user_id, item_id, (t_dat - DATE '1970-01-01')::BIGINT AS day
+            FROM read_parquet('{IDX_DIR / 'transactions_indexed.parquet'}')
+            ORDER BY user_id, day
+        ''').fetchnumpy()
+        tx_user, tx_day = torch.from_numpy(tx['user_id']), torch.from_numpy(tx['day'])
+
+        # one sortable int per transaction: user * day_mult + day offset. sorted because tx is sorted by (user, day),
+        # so a (user, day) lookup is a single searchsorted. +2 leaves room for "after the last day" queries
+        # makes a key for each unique (user, day) combination.
+        self.day0 = int(tx_day.min())
+        self.day_mult = int(tx_day.max()) - self.day0 + 2
+        self.register_buffer('tx_key', tx_user * self.day_mult + (tx_day - self.day0))
+
+        # item bought in each transaction, int32 to halve memory (31M rows), cast to long at lookup time
+        self.register_buffer('tx_item', torch.from_numpy(tx['item_id']).to(torch.int32))
+
+        # SELF ATTENTION
+        # self attention over the purchase history, item feature width (202) in and out
+        item_feat_dim = sum(e.embedding_dim for e in self.item_embs.values()) + 1 # +1 for price
+        self.attention = nn.MultiheadAttention(embed_dim=item_feat_dim, num_heads=2, batch_first=True)
+        self.hist_proj = nn.Linear(item_feat_dim, 40) # project pooled history down to balance with the 43 wide user features
+        
+
     # ========= FORWARD PASS =========
     def item_forward(self, x):
         '''
@@ -136,18 +171,57 @@ class TwoTowerRetrieval(nn.Module):
 
         return torch.cat(embs + [self.item_price[x].unsqueeze(1)], dim=1) # add on median price as a feature to the items
 
-
-    def user_features(self, x):
+    def user_history(self, x, day):
         '''
         x: batch of user_ids (row positions in customers_indexed.parquet), LongTensor (B,)
-        returns: FloatTensor (B, sum of user emb dims)
+        day: days since 1970-01-01, LongTensor (B,) or an int for the whole batch.
+             only purchases strictly before this day are history (same day baskets excluded, no leakage)
+        returns: FloatTensor (B, 40), self attention over each user's recent purchases, mean pooled and projected
+        '''
+        B, L = x.size(0), self.max_hist
+        day = torch.as_tensor(day, device=x.device).expand(B)
+
+        # where this user's block starts, and where day `day` starts inside it (= one past their last earlier purchase)
+        start = torch.searchsorted(self.tx_key, x * self.day_mult)
+        end = torch.searchsorted(self.tx_key, x * self.day_mult + (day - self.day0).clamp(0, self.day_mult - 1))
+        lens = (end - start).clamp(max=L) # (B,) real history length
+
+        # the L slots ending at `end`, oldest first. slots before the user's block are padding (left padded)
+        idx = end.unsqueeze(1) - L + torch.arange(L, device=x.device) # (B, L)
+        pad = torch.arange(L, device=x.device).unsqueeze(0) < (L - lens).unsqueeze(1) # True = padding, ignored by attention
+        ids = self.tx_item[idx.clamp(min=0)].long() # padded slots read a neighbouring row, the mask hides it
+
+        # one item_features call for the whole batch, then back to (B, L, 202)
+        h = self.item_features(ids.flatten()).view(B, L, -1)
+
+        # users with no history would have every key masked -> softmax over nothing -> NaN.
+        # unmask their last slot so attention is defined, their output is zeroed below anyway
+        empty = lens == 0
+        pad[:, -1] &= ~empty
+
+        out, _ = self.attention(h, h, h, key_padding_mask=pad, need_weights=False) # (B, L, 202)
+
+        # mean over the real positions only
+        keep = (~pad).unsqueeze(2).float() # (B, L, 1)
+        pooled = (out * keep).sum(1) / keep.sum(1) # (B, 202)
+        pooled = pooled.masked_fill(empty.unsqueeze(1), 0.0) # no history -> zero vector
+
+        return self.hist_proj(pooled)
+
+    def user_features(self, x, day):
+        '''
+        x: batch of user_ids (row positions in customers_indexed.parquet), LongTensor (B,)
+        day: days since 1970-01-01 to cut the history at, LongTensor (B,) or int (see user_history)
+        returns: FloatTensor (B, sum of user emb dims + 40), categorical embs then the history vector
         '''
         rows = self.user_cat[x] # (B, n_cat_cols). the rows of the users in the batch and only the categorical columns
 
         # for each embedding table in user data, do a weight lookup on the batch
+
         embs = [emb(rows[:, i]) for i, emb in enumerate(self.user_embs.values())]
 
-        return torch.cat(embs, dim=1)
+        # concat the purchase history vector onto the user input
+        return torch.cat(embs + [self.user_history(x, day)], dim=1)
 
 
 
@@ -175,28 +249,28 @@ class TwoTowerRetrieval(nn.Module):
 
 
     # ========= TRAINING =========
-    def batch_loss(self, item_ids, user_ids, T):
+    def batch_loss(self, item_ids, user_ids, days, T):
         '''
-        item_ids, user_ids: LongTensors (B,), already on the model's device
+        item_ids, user_ids, days: LongTensors (B,), already on the model's device
         returns: scalar logq corrected in-batch softmax loss
         '''
-        sim = self(self.user_features(user_ids), self.item_features(item_ids)) # (B,B)
+        sim = self(self.user_features(user_ids, days), self.item_features(item_ids)) # (B,B)
         return self.logq_loss(sim, T, item_ids)
 
     @staticmethod
-    def iter_batches(user_ids, item_ids, batch_size, shuffle):
+    def iter_batches(user_ids, item_ids, days, batch_size, shuffle):
         '''
-        user_ids, item_ids: LongTensors (N,), already on the model's device
-        yields (item_ids, user_ids) batches of exactly batch_size by slicing, no per row python work
+        user_ids, item_ids, days: LongTensors (N,), already on the model's device
+        yields (item_ids, user_ids, days) batches of exactly batch_size by slicing, no per row python work
         the last partial batch is dropped so every batch has the same number of in-batch negatives
         '''
         n = len(item_ids)
         order = torch.randperm(n, device=item_ids.device) if shuffle else torch.arange(n, device=item_ids.device)
         for start in range(0, n - batch_size + 1, batch_size):
             idx = order[start:start + batch_size]
-            yield item_ids[idx], user_ids[idx]
+            yield item_ids[idx], user_ids[idx], days[idx]
 
-    def train_epoch(self, user_ids, item_ids, optimizer, T, batch_size):
+    def train_epoch(self, user_ids, item_ids, days, optimizer, T, batch_size):
         '''
         one shuffled pass over the training pairs, returns the mean batch loss
         '''
@@ -205,9 +279,9 @@ class TwoTowerRetrieval(nn.Module):
         # accumulate on device, calling .item() every step would force a gpu sync per batch
         total = torch.zeros((), device=item_ids.device)
         n_batches = 0
-        for b_items, b_users in self.iter_batches(user_ids, item_ids, batch_size, shuffle=True):
+        for b_items, b_users, b_days in self.iter_batches(user_ids, item_ids, days, batch_size, shuffle=True):
             optimizer.zero_grad()
-            loss = self.batch_loss(b_items, b_users, T)
+            loss = self.batch_loss(b_items, b_users, b_days, T)
             loss.backward()
             optimizer.step()
 
@@ -229,10 +303,12 @@ class TwoTowerRetrieval(nn.Module):
         return torch.cat(embs)
 
     @torch.no_grad()
-    def recall_at_k(self, user_ids, item_ids, ks, chunk_size=1024):
+    def recall_at_k(self, user_ids, item_ids, ks, cutoff_day, chunk_size=1024):
         '''
         user_ids, item_ids: LongTensors (N,), the ground truth (user, item) purchase pairs
         ks: cutoffs, e.g. (12, 50, 100)
+        cutoff_day: int, days since 1970-01-01. every user's history is cut here, normally the first day of the
+                    eval window, so the model only sees what it would know when the recommendations are made
         returns: dict {'recall@k': float}, same definition as evaluate.recall_at_k:
                  per user |top k ∩ bought| / |bought|, averaged over every user in the pairs
         '''
@@ -254,7 +330,7 @@ class TwoTowerRetrieval(nn.Module):
             denom = n_bought[start:start + chunk_size].float() # (C,)
 
             # no log q here, the correction is only for the sampled training loss
-            scores = self.user_forward(self.user_features(u)) @ item_emb.T # (C, N_items)
+            scores = self.user_forward(self.user_features(u, cutoff_day)) @ item_emb.T # (C, N_items)
             topk = scores.topk(max_k, dim=1).indices # (C, max_k), best first
 
             hits = torch.isin(u.unsqueeze(1) * n_items + topk, keys) # (C, max_k), True if bought
@@ -266,7 +342,7 @@ class TwoTowerRetrieval(nn.Module):
         return {f'recall@{k}': totals[k] / len(eval_users) for k in ks}
 
     @torch.no_grad()
-    def eval_epoch(self, user_ids, item_ids, T, batch_size, ks=(12, 50, 100)):
+    def eval_epoch(self, user_ids, item_ids, days, T, batch_size, ks=(12, 50, 100)):
         '''
         one pass over the validation pairs, no gradient updates
         returns: (mean batch loss, dict of recall@k over the full catalog)
@@ -275,11 +351,12 @@ class TwoTowerRetrieval(nn.Module):
 
         total = torch.zeros((), device=item_ids.device)
         n_batches = 0
-        for b_items, b_users in self.iter_batches(user_ids, item_ids, batch_size, shuffle=False):
-            total += self.batch_loss(b_items, b_users, T)
+        for b_items, b_users, b_days in self.iter_batches(user_ids, item_ids, days, batch_size, shuffle=False):
+            total += self.batch_loss(b_items, b_users, b_days, T)
             n_batches += 1
 
-        recall = self.recall_at_k(user_ids, item_ids, ks) # uses every val row, not just the full batches
+        # recall: history cut at the start of the val window for everyone. uses every val row, not just the full batches
+        recall = self.recall_at_k(user_ids, item_ids, ks, cutoff_day=int(days.min()))
 
         return total.item() / max(n_batches, 1), recall
 
@@ -296,20 +373,20 @@ class TwoTowerRetrieval(nn.Module):
         self.to(device)
 
         # move the id columns to the device once, batches are then just index slices
-        train_users, train_items = train_data.user_ids.to(device), train_data.item_ids.to(device)
-        val_users, val_items = val_data.user_ids.to(device), val_data.item_ids.to(device)
+        train_users, train_items, train_days = train_data.user_ids.to(device), train_data.item_ids.to(device), train_data.days.to(device)
+        val_users, val_items, val_days = val_data.user_ids.to(device), val_data.item_ids.to(device), val_data.days.to(device)
 
         # dry run so the LazyLinear layers get their shapes before the optimizer sees the parameters
         with torch.no_grad():
             dummy = torch.zeros(2, dtype=torch.long, device=device)
-            self(self.user_features(dummy), self.item_features(dummy))
+            self(self.user_features(dummy, self.day0), self.item_features(dummy))
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
 
         history = {'train_loss': [], 'val_loss': [], **{f'recall@{k}': [] for k in ks}}
         for e in range(epochs):
-            train_loss = self.train_epoch(train_users, train_items, optimizer, T, batch_size)
-            val_loss, recall = self.eval_epoch(val_users, val_items, T, batch_size, ks)
+            train_loss = self.train_epoch(train_users, train_items, train_days, optimizer, T, batch_size)
+            val_loss, recall = self.eval_epoch(val_users, val_items, val_days, T, batch_size, ks)
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
