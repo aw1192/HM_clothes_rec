@@ -1,13 +1,16 @@
-import duckdb
+import shutil
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parents[3]  / 'data' / 'downsized'
+import duckdb
 
-ITEMS = DATA_DIR / 'articles.parquet'
-USERS = DATA_DIR / 'customers.parquet'
-INTERACTIONS = DATA_DIR / 'transactions_train.parquet'
+from hm_clothes_rec.paths import CLEANED_DIR, DOWNSIZED_DIR, IMG_DIR
 
-OUT_DIR = DATA_DIR.parent / 'cleaned'
+ITEMS = DOWNSIZED_DIR / 'articles.parquet'
+USERS = DOWNSIZED_DIR / 'customers.parquet'
+INTERACTIONS = DOWNSIZED_DIR / 'transactions_train.parquet'
+IMAGES = DOWNSIZED_DIR / 'images'
+
+OUT_DIR = CLEANED_DIR
 
 
 def clean_customers(src=USERS, out_dir=OUT_DIR):
@@ -52,8 +55,28 @@ def clean_articles(src=ITEMS, out_dir=OUT_DIR):
 ''').write_parquet(str(dest))
     return dest
 
+def clean_transactions(src=INTERACTIONS, out_dir=OUT_DIR):
+    '''
+    transactions need no cleaning (no missing values), copied as is so every downstream step reads cleaned/
+    '''
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = out_dir / 'transactions_clean.parquet'
+    shutil.copyfile(src, dest)
+    return dest
+
+def copy_images(src=IMAGES, dest=IMG_DIR):
+    '''
+    the downsized .webp thumbnails, same {first 3 chars}/{article_id}.webp layout. files already there are kept
+    '''
+    shutil.copytree(src, dest, dirs_exist_ok=True)
+    return dest
+
 if __name__ == "__main__":
     print(clean_customers())
     print(clean_articles())
+    print(clean_transactions())
+    print(copy_images())
 
 

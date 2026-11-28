@@ -4,20 +4,19 @@ Create embedding lookup tables.
 '''
 
 import json
-from pathlib import Path
 
 import duckdb
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parents[3] / 'data'
+from hm_clothes_rec.paths import CLEANED_DIR, IMG_DIR, INDEXED_DIR
 
-idx_dir = DATA_DIR / 'indexed'
+idx_dir = INDEXED_DIR
 
 idx_dir.mkdir(parents=True, exist_ok=True) # make new indexed directory
 
-customers = pd.read_parquet(str(DATA_DIR / 'cleaned' / 'customers_clean.parquet'))
-articles = pd.read_parquet(str(DATA_DIR / 'cleaned' / 'articles_clean.parquet'))
+customers = pd.read_parquet(str(CLEANED_DIR / 'customers_clean.parquet'))
+articles = pd.read_parquet(str(CLEANED_DIR / 'articles_clean.parquet'))
 
 
 # INDEXING ARTICLES DATA
@@ -46,26 +45,8 @@ for col in item_cols:
     item_emb_lookup[col] = {value: i for i, value in enumerate(uniques)}
     articles[col] = articles[col].map(item_emb_lookup[col]).astype('int64')
 
-# item probability = (# transactions with item) / (total # transactions)
-# median price = median of the item's transaction prices
-# MANUALLY CHECKED
-item_counts = duckdb.sql(f'''
-    SELECT article_id, COUNT(*) AS cnt, MEDIAN(price) AS median_price
-    FROM '{DATA_DIR / 'cleaned' / 'transactions_clean.parquet'}'
-    GROUP BY article_id
-''').df()
-
-# add item probability and median price into the articles table
-# MANUALLY CHECKED
-articles = articles.merge(item_counts, on='article_id', how='left')
-item_prob = (articles['cnt'].fillna(0) + 1) / (item_counts['cnt'].sum() + len(articles)) # add-one smoothing
-articles['item_log_prob'] = np.log(item_prob) # log q for sampling bias correction
-articles = articles.drop(columns='cnt')
-
-# items with no transactions get the median price of their product type, or if still NA, then fill with median over all items
-# MANUALLY CHECKED
-type_median = articles.groupby('product_type_name')['median_price'].transform('median')
-articles['median_price'] = articles['median_price'].fillna(type_median).fillna(articles['median_price'].median())
+# item stats from transactions (item_log_prob, median_price) are NOT computed here: they would see every split.
+# splits.add_item_stats adds them afterwards from the training split only, in place in data/indexed (run splits.py after this)
 
 # item_id = row position, the integer every model / embedding table is indexed by
 # MANUALLY CHECKED
@@ -73,7 +54,7 @@ articles.insert(0, 'item_id', np.arange(len(articles), dtype='int64'))
 
 # has_image = 1 if the article's image exists at images/{first 3 chars}/{article_id}.webp, else 0
 # MANUALLY CHECKED 
-img_dir = DATA_DIR / 'cleaned' / 'images'
+img_dir = IMG_DIR
 articles['has_image'] = [int((img_dir / aid[:3] / f'{aid}.webp').exists()) for aid in articles['article_id']]
 
 # save indexed data + lookup tables (lookup sizes = embedding num_embeddings)
@@ -123,7 +104,7 @@ with open(idx_dir / 'user_emb_lookup.json', 'w') as f:
 # swap the string ids for the integer ids above (done in duckdb, transactions is too big for pandas)
 item_map = articles[['item_id', 'article_id']]
 user_map = customers[['user_id', 'customer_id']]
-tx_path = DATA_DIR / 'cleaned' / 'transactions_clean.parquet'
+tx_path = CLEANED_DIR / 'transactions_clean.parquet'
 tx_idx_path = idx_dir / 'transactions_indexed.parquet'
 
 duckdb.sql(f'''

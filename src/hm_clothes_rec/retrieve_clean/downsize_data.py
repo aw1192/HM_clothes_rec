@@ -5,12 +5,11 @@ import duckdb
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
+from hm_clothes_rec.paths import DOWNSIZED_DIR, RAW_DIR
+
 ID_COLS = {'article_id': 'VARCHAR', 'product_code': 'VARCHAR'}
 
-# <repo root>/data
-DATA_DIR = Path(__file__).resolve().parents[3] / 'data' # get the data directory 
-RAW_DIR = DATA_DIR / 'raw'
-OUT_DIR = DATA_DIR / 'downsized'
+OUT_DIR = DOWNSIZED_DIR
 
 def csv_to_parquet(csv_path, out_path):
     csv_path = Path(csv_path)

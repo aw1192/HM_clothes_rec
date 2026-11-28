@@ -1,16 +1,19 @@
-import shutil
 from datetime import timedelta
 from pathlib import Path
 
 import duckdb
+import numpy as np
+import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parents[3] / 'data' / 'indexed'
+from hm_clothes_rec.paths import INDEXED_DIR, SPLITS_DIR
 
-ITEMS = DATA_DIR / 'articles_clean.parquet'
-USERS = DATA_DIR / 'customers_clean.parquet'
-INTERACTIONS = DATA_DIR / 'transactions_indexed.parquet'
+INTERACTIONS = INDEXED_DIR / 'transactions_indexed.parquet'
+ARTICLES = INDEXED_DIR / 'articles_indexed.parquet'
 
-OUT_DIR = DATA_DIR.parent / 'splits'
+OUT_DIR = SPLITS_DIR
+
+# split the item stats (log q, median price) are computed from. only this split's rows are seen
+STATS_SPLIT = 'train_retrieval'
 
 
 def _date_range():
@@ -69,6 +72,39 @@ def save_splits(out_dir=OUT_DIR):
     return paths
 
 
+def add_item_stats(path=ARTICLES, stats_split=STATS_SPLIT):
+    '''
+    Add the item stats the models use to data/indexed/articles_indexed.parquet, in place,
+    computed from the stats_split rows only so no later split leaks in:
+      item_log_prob: log of (# transactions with item + 1) / (# transactions + # items), add-one smoothed
+      median_price:  median of the item's transaction prices. items never bought in stats_split get the
+                     median of their product type, or if still NA, the median over all items
+    safe to rerun: existing stat columns are dropped and rebuilt
+    '''
+    path = Path(path)
+
+    # errors='ignore' so a fresh index_data.py output (no stat cols yet) and a rerun both work
+    articles = pd.read_parquet(path).drop(
+        columns=['median_price', 'item_log_prob'], errors='ignore'
+    )
+
+    item_counts = load_split(stats_split).aggregate(
+        'item_id, COUNT(*) AS cnt, MEDIAN(price) AS median_price', 'item_id'
+    ).df()
+
+    articles = articles.merge(item_counts, on='item_id', how='left') # left join keeps row order = item_id
+    item_prob = (articles['cnt'].fillna(0) + 1) / (item_counts['cnt'].sum() + len(articles))
+    articles['item_log_prob'] = np.log(item_prob) # log q for sampling bias correction
+    articles = articles.drop(columns='cnt')
+
+    type_median = articles.groupby('product_type_name')['median_price'].transform('median')
+    articles['median_price'] = articles['median_price'].fillna(type_median).fillna(articles['median_price'].median())
+
+    assert (articles['item_id'].to_numpy() == np.arange(len(articles))).all(), 'row position must equal item_id'
+    articles.to_parquet(path, index=False)
+    return path
+
+
 if __name__ == "__main__":
     paths = save_splits()
 
@@ -83,5 +119,6 @@ if __name__ == "__main__":
     assert total == all_rows, f'splits cover {total:,} of {all_rows:,} rows'
     print(f'{"total":16} {"":24} {total:>12,}')
 
-    shutil.copytree(DATA_DIR, OUT_DIR / DATA_DIR.name, dirs_exist_ok=True)
+    articles_path = add_item_stats()
+    print(f'{STATS_SPLIT} item stats -> {articles_path}')
 

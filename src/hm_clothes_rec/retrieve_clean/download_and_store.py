@@ -1,16 +1,14 @@
-from pathlib import Path
-
 import kagglehub
 
-# RUN ONLY ONCE 
+from hm_clothes_rec.paths import RAW_DIR
 
-# <repo root>/data/raw
-DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "raw"
+# RUN ONLY ONCE
 
-# Download latest version
+# Download latest version into <repo root>/data/archive/raw
+RAW_DIR.mkdir(parents=True, exist_ok=True) # creates data/archive/ on a fresh clone
 path = kagglehub.competition_download(
     'h-and-m-personalized-fashion-recommendations',
-    output_dir=str(DATA_DIR),
+    output_dir=str(RAW_DIR),
 )
 
 print("Path to competition files:", path)
